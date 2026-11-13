@@ -1,0 +1,129 @@
+name: subzero-gitea
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+services:
+  db:
+    image: postgres:17-alpine@sha256:266d3c257594e195b309ae9d1805e54c788f1d7b375f56bf6c367aac6c917e7b
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: gitea
+      POSTGRES_USER: gitea
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?Set DB_PASSWORD}
+    volumes: [postgres_data:/var/lib/postgresql/data]
+    networks: [backend]
+    healthcheck:
+      test: [CMD-SHELL, "pg_isready -h 127.0.0.1 -U gitea -d gitea"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    logging: *logging
+  gitea:
+    image: gitea/gitea:1.27.3@sha256:87a67ee09d3ae0d1df5fda5dcda3e2a1f9236a45b0a59025d6e00e46adc43bef
+    restart: unless-stopped
+    entrypoint: [/bin/sh, -ec]
+    command:
+      - |
+        mkdir -p /data/gitea
+        printf '%s' "$$RUNNER_TOKEN" > /data/gitea/runner-registration-token
+        chown 1000:1000 /data/gitea/runner-registration-token
+        chmod 600 /data/gitea/runner-registration-token
+        unset RUNNER_TOKEN
+        exec /usr/bin/entrypoint /usr/bin/s6-svscan /etc/s6
+    environment:
+      USER_UID: "1000"
+      USER_GID: "1000"
+      GITEA__database__DB_TYPE: postgres
+      GITEA__database__HOST: db:5432
+      GITEA__database__NAME: gitea
+      GITEA__database__USER: gitea
+      GITEA__database__PASSWD: ${DB_PASSWORD:?Set DB_PASSWORD}
+      GITEA__server__DOMAIN: ${GITEA_DOMAIN:?Set GITEA_DOMAIN}
+      GITEA__server__ROOT_URL: https://${GITEA_DOMAIN}/
+      GITEA__server__DISABLE_SSH: "true"
+      GITEA__server__LFS_START_SERVER: "true"
+      GITEA__server__LFS_JWT_SECRET: ${LFS_JWT_SECRET:?Set LFS_JWT_SECRET}
+      GITEA__security__INSTALL_LOCK: "true"
+      GITEA__security__SECRET_KEY: ${SECRET_KEY:?Set SECRET_KEY}
+      GITEA__security__INTERNAL_TOKEN: ${INTERNAL_TOKEN:?Set INTERNAL_TOKEN}
+      GITEA__service__DISABLE_REGISTRATION: "true"
+      GITEA__service__REQUIRE_SIGNIN_VIEW: "true"
+      GITEA__repository__DEFAULT_PRIVATE: private
+      GITEA__repository__FORCE_PRIVATE: "true"
+      GITEA__actions__ENABLED: "true"
+      GITEA__actions__DEFAULT_ACTIONS_URL: github
+      GITEA_RUNNER_REGISTRATION_TOKEN_FILE: /data/gitea/runner-registration-token
+      RUNNER_TOKEN: ${RUNNER_TOKEN:?Set RUNNER_TOKEN}
+    volumes: [gitea_data:/data]
+    networks:
+      backend: {}
+      runner_net: {}
+      proxy:
+        aliases: [gitea-web]
+    depends_on:
+      db: {condition: service_healthy}
+    healthcheck:
+      test: [CMD, wget, -q, --spider, http://127.0.0.1:3000/api/healthz]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+    logging: *logging
+  bootstrap:
+    image: gitea/gitea:1.27.3@sha256:87a67ee09d3ae0d1df5fda5dcda3e2a1f9236a45b0a59025d6e00e46adc43bef
+    user: "1000:1000"
+    restart: "no"
+    entrypoint: [/bin/sh, -ec]
+    command:
+      - |
+        if gitea --config /data/gitea/conf/app.ini admin user list | awk 'NR>1 {print $$2}' | grep -Fxq "$$ADMIN_USERNAME"; then
+          echo 'Administrator already exists; password unchanged.'
+        else
+          gitea --config /data/gitea/conf/app.ini admin user create --username "$$ADMIN_USERNAME" --email "$$ADMIN_EMAIL" --password "$$ADMIN_PASSWORD" --admin --must-change-password=false
+        fi
+    environment:
+      ADMIN_USERNAME: ${ADMIN_USERNAME:-subzero}
+      ADMIN_EMAIL: ${ADMIN_EMAIL:?Set ADMIN_EMAIL}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:?Set ADMIN_PASSWORD}
+    volumes: [gitea_data:/data]
+    networks: [backend]
+    depends_on:
+      gitea: {condition: service_healthy}
+    logging: *logging
+  runner:
+    image: gitea/runner:5.3.0-dind@sha256:9ff0a4c17c9dc6f41dfcf742ddd1b72f698b391f4438e41550cfb5902da2b7f5
+    privileged: true
+    restart: unless-stopped
+    entrypoint: [/bin/sh, -ec]
+    command:
+      - |
+        printf '%s\n' 'log:' '  level: info' 'runner:' '  file: /data/.runner' '  capacity: 1' '  timeout: 3h' 'container:' '  privileged: false' '  valid_volumes: []' '  docker_host: "-"' 'cache:' '  enabled: false' > /data/config.yaml
+        exec s6-svscan /etc/s6
+    environment:
+      GITEA_INSTANCE_URL: https://${GITEA_DOMAIN}/
+      GITEA_RUNNER_NAME: subzero-portainer
+      GITEA_RUNNER_REGISTRATION_TOKEN: ${RUNNER_TOKEN:?Set RUNNER_TOKEN}
+      GITEA_RUNNER_LABELS: ubuntu-latest:docker://gitea/runner-images:ubuntu-latest,ubuntu-22.04:docker://gitea/runner-images:ubuntu-22.04
+      CONFIG_FILE: /data/config.yaml
+    volumes:
+      - runner_data:/data
+      - runner_docker:/var/lib/docker
+    networks: [runner_net]
+    depends_on:
+      gitea: {condition: service_healthy}
+      bootstrap: {condition: service_completed_successfully}
+    logging: *logging
+networks:
+  backend:
+    internal: true
+  runner_net: {}
+  proxy:
+    external: true
+    name: ${PROXY_NETWORK:-proxy-net}
+volumes:
+  postgres_data: {}
+  gitea_data: {}
+  runner_data: {}
+  runner_docker: {}
